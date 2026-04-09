@@ -1,0 +1,34 @@
+[project]
+name = "vggt-serve"
+version = "0.1.0"
+description = "Network-accessible VGGT reconstruction service."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "python-multipart>=0.0.9,<1",
+    "pydantic>=2.5,<3",
+    "pydantic-settings>=2.0,<3",
+    "orjson>=3.10,<4",
+    "numpy<2",
+    "Pillow>=10,<12",
+]
+
+[project.optional-dependencies]
+test = [
+    "httpx>=0.27,<1",
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<1",
+]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vggt_serve*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

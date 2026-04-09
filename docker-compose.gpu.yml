@@ -1,0 +1,5 @@
+services:
+  vggt-serve:
+    gpus: ${DOCKER_GPUS:-all}
+    shm_size: ${SHM_SIZE:-8gb}
+    ipc: host

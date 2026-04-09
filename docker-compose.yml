@@ -1,0 +1,32 @@
+services:
+  vggt-serve:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vggt-serve:latest
+    restart: unless-stopped
+    environment:
+      VGGT_SERVE_HOST: 0.0.0.0
+      VGGT_SERVE_PORT: ${SERVICE_PORT:-8000}
+      VGGT_SERVE_MODEL_ID: ${VGGT_SERVE_MODEL_ID:-facebook/VGGT-1B}
+      VGGT_SERVE_DATA_ROOT: /app/data/runs
+      HF_HOME: /root/.cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /root/.cache/huggingface/hub
+    ports:
+      - "${SERVICE_PORT:-8000}:${SERVICE_PORT:-8000}"
+    volumes:
+      - ./data:/app/data
+      - huggingface-cache:/root/.cache/huggingface
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:${SERVICE_PORT:-8000}/healthz >/dev/null || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  huggingface-cache:

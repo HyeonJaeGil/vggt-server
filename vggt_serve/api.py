@@ -1,0 +1,357 @@
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
+from time import perf_counter
+from uuid import uuid4
+
+from fastapi import APIRouter, File, Form, Request, UploadFile, status
+from fastapi.responses import FileResponse, JSONResponse
+from PIL import Image, UnidentifiedImageError
+
+from .config import Settings
+from .errors import (
+    ApiError,
+    ArtifactNotFoundApiError,
+    ExecutionFailedApiError,
+    ServiceUnavailableApiError,
+    UnsupportedMediaApiError,
+    ValidationApiError,
+)
+from .inference import EngineRunResult, VGGTInferenceEngine
+from .schemas import (
+    ArtifactInfo,
+    CameraResult,
+    ErrorInfo,
+    HealthResponse,
+    InputSummary,
+    ReadyResponse,
+    ReconstructionResponse,
+    TimingStats,
+)
+from .storage import ArtifactDescriptor, PreparedImage, sanitize_filename, write_json
+
+
+LOGGER = logging.getLogger(__name__)
+ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png"}
+CONTENT_TYPE_EXTENSION = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+}
+
+router = APIRouter()
+
+
+def get_settings(request: Request) -> Settings:
+    return request.app.state.settings
+
+
+def get_engine(request: Request) -> VGGTInferenceEngine:
+    return request.app.state.engine
+
+
+async def _prepare_uploads(
+    *,
+    files: list[UploadFile] | None,
+    run_dir: Path,
+    settings: Settings,
+) -> tuple[list[PreparedImage], int]:
+    if not files:
+        raise ValidationApiError("At least one image is required.")
+    if len(files) > settings.max_images:
+        raise ValidationApiError(f"At most {settings.max_images} images are allowed per request.")
+
+    input_dir = run_dir / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+
+    prepared_images: list[PreparedImage] = []
+    total_bytes = 0
+
+    for index, upload in enumerate(files, start=1):
+        content_type = upload.content_type or ""
+        if content_type not in ALLOWED_CONTENT_TYPES:
+            raise UnsupportedMediaApiError(
+                f"Unsupported content type for '{upload.filename or f'image_{index}'}': {content_type or 'unknown'}."
+            )
+
+        payload = await upload.read()
+        await upload.close()
+
+        if not payload:
+            raise ValidationApiError(f"Uploaded file '{upload.filename or f'image_{index}'}' is empty.")
+        if len(payload) > settings.max_upload_bytes_per_file:
+            raise ValidationApiError(
+                f"Uploaded file '{upload.filename or f'image_{index}'}' exceeds the per-file size limit."
+            )
+
+        total_bytes += len(payload)
+        if total_bytes > settings.max_upload_bytes_total:
+            raise ValidationApiError("Combined upload size exceeds the total request size limit.")
+
+        try:
+            with Image.open(BytesIO(payload)) as image:
+                image.verify()
+            with Image.open(BytesIO(payload)) as image:
+                width, height = image.convert("RGB").size
+        except (UnidentifiedImageError, OSError) as exc:
+            raise ValidationApiError(f"Uploaded file '{upload.filename or f'image_{index}'}' is not a valid image.") from exc
+
+        original_name = upload.filename or f"image_{index}"
+        safe_name = sanitize_filename(original_name, f"image_{index}")
+        if Path(safe_name).suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+            safe_name += CONTENT_TYPE_EXTENSION[content_type]
+        stored_name = f"{index:03d}_{safe_name}"
+        output_path = input_dir / stored_name
+        output_path.write_bytes(payload)
+
+        prepared_images.append(
+            PreparedImage(
+                original_filename=original_name,
+                stored_filename=stored_name,
+                path=output_path,
+                size_bytes=len(payload),
+                width=width,
+                height=height,
+                content_type=content_type,
+            )
+        )
+
+    return prepared_images, total_bytes
+
+
+def _artifact_to_response(request: Request, request_id: str, artifact: ArtifactDescriptor) -> ArtifactInfo:
+    return ArtifactInfo(
+        name=artifact.name,
+        url=str(request.url_for("download_artifact", request_id=request_id, name=artifact.name)),
+        content_type=artifact.content_type,
+        size_bytes=artifact.size_bytes,
+    )
+
+
+def _build_response(
+    *,
+    request_id: str,
+    client_request_id: str | None,
+    status_value: str,
+    input_summary: InputSummary | None,
+    timings_ms: TimingStats,
+    camera_results: list[dict] | None = None,
+    artifacts: list[ArtifactInfo] | None = None,
+    error: ErrorInfo | None = None,
+) -> ReconstructionResponse:
+    return ReconstructionResponse(
+        request_id=request_id,
+        client_request_id=client_request_id,
+        status=status_value,  # type: ignore[arg-type]
+        input_summary=input_summary,
+        timings_ms=timings_ms,
+        camera_results=[CameraResult.model_validate(item) for item in (camera_results or [])],
+        artifacts=artifacts or [],
+        error=error,
+    )
+
+
+@router.get("/healthz", response_model=HealthResponse)
+async def healthz() -> HealthResponse:
+    return HealthResponse(status="ok")
+
+
+@router.get("/readyz", response_model=ReadyResponse)
+async def readyz(request: Request) -> JSONResponse:
+    engine = get_engine(request)
+    ready = engine.is_ready()
+    payload = ReadyResponse(
+        status="ready" if ready else "not_ready",
+        ready=ready,
+        device=engine.device_description,
+        error=engine.last_error,
+    )
+    status_code = status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE
+    return JSONResponse(payload.model_dump(mode="json"), status_code=status_code)
+
+
+@router.get("/v1/artifacts/{request_id}/{name}", name="download_artifact")
+async def download_artifact(request_id: str, name: str, request: Request) -> FileResponse:
+    settings = get_settings(request)
+    run_dir = (settings.data_root / request_id).resolve()
+    candidate = (run_dir / name).resolve()
+
+    if candidate.parent != run_dir or not candidate.exists() or not candidate.is_file():
+        raise ArtifactNotFoundApiError()
+
+    media_type = "application/octet-stream"
+    if candidate.suffix == ".json":
+        media_type = "application/json"
+    return FileResponse(candidate, media_type=media_type, filename=candidate.name)
+
+
+@router.post("/v1/reconstructions", response_model=ReconstructionResponse)
+async def create_reconstruction(
+    request: Request,
+    images: list[UploadFile] | None = File(default=None),
+    scene_id: str | None = Form(default=None),
+    client_request_id: str | None = Form(default=None),
+    depth_conf_threshold: float | None = Form(default=None),
+) -> JSONResponse:
+    settings = get_settings(request)
+    engine = get_engine(request)
+    request_id = uuid4().hex
+    run_dir = settings.data_root / request_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    threshold = (
+        settings.default_depth_conf_threshold if depth_conf_threshold is None else float(depth_conf_threshold)
+    )
+    if threshold < 0:
+        error = ValidationApiError("depth_conf_threshold must be greater than or equal to 0.")
+    elif not engine.is_ready() and engine.last_error:
+        error = ServiceUnavailableApiError(engine.last_error)
+    else:
+        error = None
+
+    start = perf_counter()
+    prepared_images: list[PreparedImage] = []
+    input_summary: InputSummary | None = None
+    validation_ms = 0
+
+    request_payload = {
+        "request_id": request_id,
+        "scene_id": scene_id,
+        "client_request_id": client_request_id,
+        "depth_conf_threshold": threshold,
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "filenames": [upload.filename for upload in images or []],
+    }
+    write_json(run_dir / "request.json", request_payload)
+
+    try:
+        if error is not None:
+            raise error
+
+        prepared_images, total_bytes = await _prepare_uploads(files=images, run_dir=run_dir, settings=settings)
+        validation_ms = int((perf_counter() - start) * 1000)
+        input_summary = InputSummary(
+            scene_id=scene_id,
+            image_count=len(prepared_images),
+            filenames=[image.original_filename for image in prepared_images],
+            total_bytes=total_bytes,
+        )
+
+        request_payload["files"] = [
+            {
+                "original_filename": image.original_filename,
+                "stored_filename": image.stored_filename,
+                "content_type": image.content_type,
+                "size_bytes": image.size_bytes,
+                "width": image.width,
+                "height": image.height,
+            }
+            for image in prepared_images
+        ]
+        write_json(run_dir / "request.json", request_payload)
+
+        result: EngineRunResult = engine.run(
+            request_id=request_id,
+            run_dir=run_dir,
+            images=prepared_images,
+            depth_conf_threshold=threshold,
+        )
+
+        result_json_artifact = run_dir / "result.json"
+        artifact_descriptors = list(result.artifacts)
+        artifact_descriptors.append(
+            ArtifactDescriptor(
+                name=result_json_artifact.name,
+                path=result_json_artifact,
+                content_type="application/json",
+                size_bytes=0,
+            )
+        )
+        artifacts = [_artifact_to_response(request, request_id, artifact) for artifact in artifact_descriptors]
+
+        response_payload = _build_response(
+            request_id=request_id,
+            client_request_id=client_request_id,
+            status_value="succeeded",
+            input_summary=input_summary,
+            timings_ms=TimingStats(
+                validation=validation_ms,
+                inference=result.timings_ms["inference"],
+                postprocess=result.timings_ms["postprocess"],
+                total=int((perf_counter() - start) * 1000),
+            ),
+            camera_results=result.camera_results,
+            artifacts=artifacts,
+        )
+        write_json(result_json_artifact, response_payload.model_dump(mode="json"))
+
+        result_json_artifact_descriptor = artifacts[-1].model_copy(
+            update={"size_bytes": result_json_artifact.stat().st_size}
+        )
+        response_payload.artifacts[-1] = result_json_artifact_descriptor
+        write_json(result_json_artifact, response_payload.model_dump(mode="json"))
+
+        LOGGER.info(
+            "Request succeeded",
+            extra={
+                "request_id": request_id,
+                "scene_id": scene_id,
+                "status": "succeeded",
+                "image_count": len(prepared_images),
+                "device": engine.device_description,
+                "timings_ms": response_payload.timings_ms.model_dump(mode="json"),
+            },
+        )
+        return JSONResponse(response_payload.model_dump(mode="json"), status_code=status.HTTP_200_OK)
+
+    except ApiError as exc:
+        response_payload = _build_response(
+            request_id=request_id,
+            client_request_id=client_request_id,
+            status_value="failed",
+            input_summary=input_summary,
+            timings_ms=TimingStats(
+                validation=validation_ms or int((perf_counter() - start) * 1000),
+                total=int((perf_counter() - start) * 1000),
+            ),
+            error=ErrorInfo(code=exc.code, message=exc.message),
+        )
+        write_json(run_dir / "result.json", response_payload.model_dump(mode="json"))
+        LOGGER.warning(
+            "Request failed",
+            extra={
+                "request_id": request_id,
+                "scene_id": scene_id,
+                "status": "failed",
+                "code": exc.code,
+                "image_count": len(prepared_images),
+            },
+        )
+        return JSONResponse(response_payload.model_dump(mode="json"), status_code=exc.status_code)
+    except Exception as exc:  # pragma: no cover - protection for runtime failures
+        api_error = ExecutionFailedApiError(str(exc))
+        response_payload = _build_response(
+            request_id=request_id,
+            client_request_id=client_request_id,
+            status_value="failed",
+            input_summary=input_summary,
+            timings_ms=TimingStats(
+                validation=validation_ms or int((perf_counter() - start) * 1000),
+                total=int((perf_counter() - start) * 1000),
+            ),
+            error=ErrorInfo(code=api_error.code, message=api_error.message),
+        )
+        write_json(run_dir / "result.json", response_payload.model_dump(mode="json"))
+        LOGGER.exception(
+            "Unhandled request failure",
+            extra={
+                "request_id": request_id,
+                "scene_id": scene_id,
+                "status": "failed",
+                "code": api_error.code,
+                "image_count": len(prepared_images),
+            },
+        )
+        return JSONResponse(response_payload.model_dump(mode="json"), status_code=api_error.status_code)

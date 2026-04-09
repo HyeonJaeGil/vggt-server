@@ -1,0 +1,17 @@
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.DS_Store
+.env
+.codex
+client_outputs/
+condaenv.*.requirements.txt
+condaenv.*.yaml
+data/
+!data/runs/
+!data/runs/.gitkeep

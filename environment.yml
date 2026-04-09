@@ -1,0 +1,17 @@
+name: vggt-serve-py312
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pytorch=2.3.1
+  - torchvision=0.18.1
+  - pytorch-cuda=12.1
+  - numpy<2
+  - pillow
+  - pip
+  - pip:
+      - -e ./vggt
+      - -e .[test]
+
