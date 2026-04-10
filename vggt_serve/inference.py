@@ -172,19 +172,25 @@ class VGGTInferenceEngine:
                 enabled=self._device.type == "cuda",
                 dtype=self._dtype,
             ):
-                predictions = self._model(tensor_images)
+                # Run the minimal inference path used by the reference handler:
+                # aggregator -> camera_head -> depth_head.
+                batched_images = tensor_images[None]
+                aggregated_tokens_list, patch_start_idx = self._model.aggregator(batched_images)
+                pose_enc = self._model.camera_head(aggregated_tokens_list)[-1]
+                depth, depth_conf = self._model.depth_head(
+                    aggregated_tokens_list,
+                    batched_images,
+                    patch_start_idx,
+                )
 
-            pose_enc = predictions["pose_enc"]
-            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, tensor_images.shape[-2:])
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, batched_images.shape[-2:])
 
         inference_ms = int((perf_counter() - preprocess_start) * 1000)
 
         extrinsic_np = extrinsic.squeeze(0).detach().to(self._torch.float32).cpu().numpy().astype(np.float32)
         intrinsic_np = intrinsic.squeeze(0).detach().to(self._torch.float32).cpu().numpy().astype(np.float32)
-        depth_np = predictions["depth"].squeeze(0).detach().to(self._torch.float32).cpu().numpy().astype(np.float32)
-        depth_conf_np = (
-            predictions["depth_conf"].squeeze(0).detach().to(self._torch.float32).cpu().numpy().astype(np.float32)
-        )
+        depth_np = depth.squeeze(0).detach().to(self._torch.float32).cpu().numpy().astype(np.float32)
+        depth_conf_np = depth_conf.squeeze(0).detach().to(self._torch.float32).cpu().numpy().astype(np.float32)
 
         postprocess_start = perf_counter()
         camera_results: list[dict[str, Any]] = []
