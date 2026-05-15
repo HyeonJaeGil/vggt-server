@@ -38,3 +38,9 @@ def test_vggt_default_depth_conf_threshold_is_low_enough_for_sparse_sequences(tm
     settings = Settings(data_root=tmp_path / "runs")
 
     assert settings.vggt_default_depth_conf_threshold == 1.0
+
+
+def test_default_max_images_is_32(tmp_path) -> None:
+    settings = Settings(data_root=tmp_path / "runs")
+
+    assert settings.max_images == 32

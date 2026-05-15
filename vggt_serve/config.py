@@ -46,7 +46,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("RECON_SERVE_BACKEND", "VGGT_SERVE_BACKEND"),
     )
     max_images: int = Field(
-        default=16,
+        default=32,
         validation_alias=AliasChoices("RECON_SERVE_MAX_IMAGES", "VGGT_SERVE_MAX_IMAGES"),
     )
     max_upload_bytes_per_file: int = Field(
